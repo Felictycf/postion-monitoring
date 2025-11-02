@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Fast Binance UM Perpetual - Open Interest Anomaly Scanner (loop, save CSV per run)
+Fast Binance UM Perpetual - Open Interest Anomaly Scanner (loop, save to SQLite)
 - 周期：5m/15m/30m/1h/4h
 - 每隔 2.5 分钟扫描一次
-- 每次扫描保存一个 CSV（文件名包含上海时区时间戳）
+- 每次扫描保存到 SQLite 数据库
 """
 
 from binance.um_futures import UMFutures
@@ -16,6 +16,7 @@ from datetime import datetime
 import math
 import os
 import time
+import sqlite3
 
 # ================= 可配置 =================
 # 周期与历史长度（足够做滚动统计，不要太大）
@@ -60,8 +61,8 @@ PRINT_TOP_N_PER_PERIOD = 12
 # 轮询间隔（秒）= 2.5 分钟
 POLL_INTERVAL_SEC = 400
 
-# 每轮结果保存目录（会自动创建）
-SAVE_DIR = "./oi_scans"
+# SQLite 数据库路径
+DB_PATH = "./oi_alerts.db"
 # ========================================
 
 # 初始化 UMFutures（兼容旧版库：不传 session）
@@ -201,39 +202,114 @@ def scan_once(symbols: List[str]) -> pd.DataFrame:
             )
     return df
 
-def save_scan_csv(df: pd.DataFrame, save_dir: str, run_time_sh: datetime) -> str:
+def init_database(db_path: str):
     """
-    将当前扫描结果保存为独立 CSV。
-    - 文件名：oi_alerts_YYYYmmdd_HHMMSS_SH.csv（上海时区）
-    - 数据中的时间列也转换为上海时间（新增 timestamp_shanghai 列）
-    - 额外加一列 scan_time_shanghai（整轮扫描时间，便于回放）
+    初始化 SQLite 数据库，创建 oi_alerts 表（如果不存在）。
+    表结构：
+    - id: 自增主键
+    - scan_time_shanghai: 扫描时间（上海时区）
+    - timestamp: 数据时间戳（UTC）
+    - timestamp_shanghai: 数据时间戳（上海时区）
+    - symbol: 交易对
+    - period: 时间周期
+    - level: 告警等级
+    - direction: 方向
+    - dOI: OI 变化（张数）
+    - dOIValue: OI 名义变化（USD）
+    - oi_value_pct: OI 百分比变化
+    - z_abs: z-score
     """
-    os.makedirs(save_dir, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
 
-    # 统一时间：新增上海时间列
-    if "timestamp" in df.columns and not df.empty:
-        ts_sh = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert(ZoneInfo("Asia/Shanghai"))
-        df_out = df.copy()
-        df_out.insert(1, "timestamp_shanghai", ts_sh.dt.strftime("%Y-%m-%d %H:%M:%S%z"))
-    else:
-        df_out = df.copy()
-        df_out.insert(0, "timestamp_shanghai", pd.Series(dtype=str))
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS oi_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scan_time_shanghai TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            timestamp_shanghai TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            period TEXT NOT NULL,
+            level TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            dOI REAL,
+            dOIValue REAL,
+            oi_value_pct REAL,
+            z_abs REAL
+        )
+    """)
 
-    # 扫描时间（整轮）
-    df_out.insert(0, "scan_time_shanghai", run_time_sh.strftime("%Y-%m-%d %H:%M:%S%z"))
+    # 创建索引以提高查询性能
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_scan_time
+        ON oi_alerts(scan_time_shanghai)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_symbol
+        ON oi_alerts(symbol)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_period
+        ON oi_alerts(period)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_level
+        ON oi_alerts(level)
+    """)
 
-    # 文件名（上海时区）
-    fname = f"oi_alerts_{run_time_sh.strftime('%Y%m%d_%H%M%S')}_SH.csv"
-    fpath = os.path.join(save_dir, fname)
-    df_out.to_csv(fpath, index=False, encoding="utf-8")
-    print(f"[Saved] {fpath}")
-    return fpath
+    conn.commit()
+    conn.close()
+    print(f"[Database] Initialized at {db_path}")
+
+def save_to_database(df: pd.DataFrame, db_path: str, run_time_sh: datetime) -> int:
+    """
+    将当前扫描结果保存到 SQLite 数据库。
+    - 添加 scan_time_shanghai（整轮扫描时间）
+    - 添加 timestamp_shanghai（数据时间戳的上海时区版本）
+    - 返回插入的记录数
+    """
+    if df.empty:
+        print("[Database] No alerts to save")
+        return 0
+
+    # 准备数据
+    df_out = df.copy()
+
+    # 添加扫描时间（上海时区）
+    df_out["scan_time_shanghai"] = run_time_sh.strftime("%Y-%m-%d %H:%M:%S%z")
+
+    # 转换 timestamp 为字符串（UTC）
+    df_out["timestamp"] = pd.to_datetime(df_out["timestamp"], utc=True).dt.strftime("%Y-%m-%d %H:%M:%S%z")
+
+    # 添加上海时区的时间戳
+    ts_sh = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert(ZoneInfo("Asia/Shanghai"))
+    df_out["timestamp_shanghai"] = ts_sh.dt.strftime("%Y-%m-%d %H:%M:%S%z")
+
+    # 选择要保存的列
+    columns = [
+        "scan_time_shanghai", "timestamp", "timestamp_shanghai",
+        "symbol", "period", "level", "direction",
+        "dOI", "dOIValue", "oi_value_pct", "z_abs"
+    ]
+    df_out = df_out[columns]
+
+    # 保存到数据库
+    conn = sqlite3.connect(db_path)
+    df_out.to_sql("oi_alerts", conn, if_exists="append", index=False)
+    conn.close()
+
+    record_count = len(df_out)
+    print(f"[Database] Saved {record_count} records to {db_path}")
+    return record_count
 
 def main_once(symbols: List[str]) -> pd.DataFrame:
     """执行一次扫描并返回结果 DataFrame（UTC 时间戳列），打印时已转上海。"""
     return scan_once(symbols)
 
 def main():
+    # 初始化数据库
+    init_database(DB_PATH)
+
     print("Fetching UM perpetual symbols ...")
     syms_all = get_um_perp_symbols()
     print(f"UM perpetual (filtered by quote: {QUOTE_WHITELIST if QUOTE_WHITELIST else 'ALL'}): {len(syms_all)}")
@@ -247,7 +323,7 @@ def main():
             run_ts_sh = datetime.now(tz=sh_tz)
             print(f"\n=== New scan @ {run_ts_sh.strftime('%Y-%m-%d %H:%M:%S%z')} (Asia/Shanghai) ===")
             df = main_once(syms)
-            save_scan_csv(df, SAVE_DIR, run_ts_sh)
+            save_to_database(df, DB_PATH, run_ts_sh)
             # 休眠 2.5 分钟
             time.sleep(POLL_INTERVAL_SEC)
     except KeyboardInterrupt:
