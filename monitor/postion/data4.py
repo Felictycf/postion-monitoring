@@ -102,6 +102,23 @@ def fetch_oi_hist(symbol: str, period: str, limit: int) -> pd.DataFrame:
     df = df[["timestamp","sumOpenInterest","sumOpenInterestValue"]].sort_values("timestamp").reset_index(drop=True)
     return df
 
+def fetch_last_two_closes(symbol: str, period: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """
+    返回 (last_close, prev_close, pct_change)
+    pct_change = (last - prev) / prev
+    """
+    kl = um.klines(symbol=symbol, interval=period, limit=2)
+    if not kl or len(kl) < 2:
+        # 尝试退化到1根（仅返回最新价）
+        if kl and len(kl) == 1:
+            last_close = float(kl[0][4])
+            return last_close, None, None
+        return None, None, None
+    prev_close = float(kl[0][4])
+    last_close = float(kl[1][4])
+    pct = None if prev_close == 0 else (last_close - prev_close) / prev_close
+    return last_close, prev_close, pct
+
 def classify_level(z_abs: float, pct: float, abs_usd: float) -> Optional[str]:
     def _is_nan(v):
         return (v is None) or (isinstance(v, float) and math.isnan(v))
@@ -114,7 +131,7 @@ def classify_level(z_abs: float, pct: float, abs_usd: float) -> Optional[str]:
 
 def process_one(symbol: str, period: str, limit: int, win: int) -> Optional[Dict[str, Any]]:
     """
-    仅抓 OI，计算 ΔOIValue 的 z-score / 百分比 / 绝对名义USD，决定是否触发。
+    仅抓 OI，算出是否异动；若异动，再补拉该周期的最新两根收盘价以计算价格变化幅度。
     返回告警字典；无告警返回 None
     """
     df = fetch_oi_hist(symbol, period, limit)
@@ -141,6 +158,8 @@ def process_one(symbol: str, period: str, limit: int, win: int) -> Optional[Dict
     if not level:
         return None
 
+    # 仅触发时补拉价格，并计算价格变化幅度
+    last_close, prev_close, px_pct = fetch_last_two_closes(symbol, period)
     direction = "↑" if (last["dOIValue"] > 0) else ("↓" if last["dOIValue"] < 0 else "=")
 
     return {
@@ -153,6 +172,8 @@ def process_one(symbol: str, period: str, limit: int, win: int) -> Optional[Dict
         "dOIValue": float(last["dOIValue"]) if pd.notna(last["dOIValue"]) else np.nan,
         "oi_value_pct": float(pct) if pct is not None else np.nan,
         "z_abs": float(z_abs) if z_abs is not None else np.nan,
+        "price": float(last_close) if last_close is not None else np.nan,
+        "price_pct": float(px_pct) if px_pct is not None else np.nan,
     }
 
 def scan_once(symbols: List[str]) -> pd.DataFrame:
@@ -176,7 +197,7 @@ def scan_once(symbols: List[str]) -> pd.DataFrame:
     if not alerts:
         print("\n=== No anomalies (latest bars) ===")
         return pd.DataFrame(columns=[
-            "timestamp","symbol","period","level","direction","dOI","dOIValue","oi_value_pct","z_abs"
+            "timestamp","symbol","period","level","direction","dOI","dOIValue","oi_value_pct","z_abs","price","price_pct"
         ])
 
     df = pd.DataFrame(alerts)
@@ -184,7 +205,7 @@ def scan_once(symbols: List[str]) -> pd.DataFrame:
     df = df.sort_values(["period", "abs_dOIValue"], ascending=[True, False]).drop(columns=["abs_dOIValue"]).reset_index(drop=True)
 
     # 打印（时间转上海）
-    print("\n=== OI Anomaly Alerts (latest bar, OI-only) ===")
+    print("\n=== OI Anomaly Alerts (latest bar, fast mode) ===")
     for period in PERIODS.keys():
         sub = df[df["period"] == period]
         if sub.empty:
@@ -193,12 +214,15 @@ def scan_once(symbols: List[str]) -> pd.DataFrame:
         print(f"\n[{period}] Top {topk}:")
         for _, r in sub.head(topk).iterrows():
             ts_sh = pd.to_datetime(r["timestamp"], utc=True).tz_convert(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S%z")
+            px = r['price'] if not np.isnan(r['price']) else 'n/a'
+            pxpct = (f"{r['price_pct']*100:+.2f}%" if not np.isnan(r['price_pct']) else "n/a")
             print(
                 f"{ts_sh}  {r['symbol']:>12}  {period:>3}  "
                 f"{r['direction']}  {r['level']:<9}  "
                 f"ΔOIv={r['dOIValue']:,.0f} USD  "
                 f"pct={r['oi_value_pct']*100:5.1f}%  "
-                f"z={r['z_abs']:.2f}"
+                f"z={r['z_abs']:.2f}  "
+                f"px={px}  pxΔ={pxpct}"
             )
     return df
 
@@ -218,6 +242,8 @@ def init_database(db_path: str):
     - dOIValue: OI 名义变化（USD）
     - oi_value_pct: OI 百分比变化
     - z_abs: z-score
+    - price: 最新收盘价
+    - price_pct: 价格变化百分比
     """
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
@@ -235,7 +261,9 @@ def init_database(db_path: str):
             dOI REAL,
             dOIValue REAL,
             oi_value_pct REAL,
-            z_abs REAL
+            z_abs REAL,
+            price REAL,
+            price_pct REAL
         )
     """)
 
@@ -289,7 +317,7 @@ def save_to_database(df: pd.DataFrame, db_path: str, run_time_sh: datetime) -> i
     columns = [
         "scan_time_shanghai", "timestamp", "timestamp_shanghai",
         "symbol", "period", "level", "direction",
-        "dOI", "dOIValue", "oi_value_pct", "z_abs"
+        "dOI", "dOIValue", "oi_value_pct", "z_abs", "price", "price_pct"
     ]
     df_out = df_out[columns]
 
