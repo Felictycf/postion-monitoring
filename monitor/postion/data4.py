@@ -59,7 +59,7 @@ MAX_WORKERS = 24
 PRINT_TOP_N_PER_PERIOD = 12
 
 # 轮询间隔（秒）= 2.5 分钟
-POLL_INTERVAL_SEC = 400
+POLL_INTERVAL_SEC = 300
 
 # SQLite 数据库路径
 DB_PATH = "./oi_alerts.db"
@@ -180,22 +180,28 @@ def classify_level(z_abs: float, pct: float, abs_usd: float) -> Optional[str]:
             return level
     return None
 
-def process_one(symbol: str, period: str, limit: int, win: int) -> Optional[Dict[str, Any]]:
+def process_one(symbol: str, period: str, limit: int, win: int, cached_oi: Optional[Dict[str, float]] = None) -> Optional[Dict[str, Any]]:
     """
     混合使用历史数据和实时数据：
     1. 获取历史 OI 数据用于统计基准（计算 z-score）
-    2. 获取实时 OI 数据作为最新值
+    2. 使用缓存的实时 OI 数据作为最新值（避免重复调用）
     3. 计算实时 OI 与历史最后一根的变化
+
+    参数:
+        cached_oi: 预先获取的实时OI数据（可选），用于避免重复API调用
     """
     # 获取历史数据用于统计
     df_hist = fetch_oi_hist(symbol, period, limit)
     if df_hist.empty or len(df_hist) < max(40, win + 5):
         return None
 
-    # 获取实时持仓量
-    current_oi = fetch_current_oi(symbol)
-    if not current_oi:
-        return None
+    # 使用缓存的实时持仓量，如果没有缓存则获取
+    if cached_oi is None:
+        current_oi = fetch_current_oi(symbol)
+        if not current_oi:
+            return None
+    else:
+        current_oi = cached_oi
 
     # 历史数据的最后一根（用于对比）
     last_hist = df_hist.iloc[-1]
@@ -251,14 +257,39 @@ def process_one(symbol: str, period: str, limit: int, win: int) -> Optional[Dict
     }
 
 def scan_once(symbols: List[str]) -> pd.DataFrame:
-    tasks: List[Tuple[str,str,int,int]] = []
-    for sym in symbols:
+    """
+    扫描一轮，优化版：
+    1. 先批量获取所有 symbol 的实时 OI（每个 symbol 只调用一次）
+    2. 然后所有周期共享同一个 symbol 的实时 OI 数据
+    """
+    print(f"\n[Step 1/3] Fetching real-time OI for {len(symbols)} symbols...")
+
+    # 第一步：批量获取所有 symbol 的实时 OI
+    oi_cache = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = {ex.submit(fetch_current_oi, sym): sym for sym in symbols}
+        for fut in as_completed(futures):
+            sym = futures[fut]
+            try:
+                oi = fut.result()
+                if oi:
+                    oi_cache[sym] = oi
+            except Exception as e:
+                print(f"[WARN] Failed to fetch OI for {sym}: {e}")
+
+    print(f"[Step 2/3] Successfully fetched OI for {len(oi_cache)}/{len(symbols)} symbols")
+
+    # 第二步：并发扫描所有 symbol × period 组合（使用缓存的 OI）
+    print(f"[Step 3/3] Scanning {len(oi_cache)} symbols across {len(PERIODS)} periods...")
+
+    tasks: List[Tuple[str, str, int, int, Optional[Dict]]] = []
+    for sym in oi_cache.keys():  # 只扫描成功获取 OI 的 symbol
         for period, limit in PERIODS.items():
-            tasks.append((sym, period, limit, ROLLING_WIN.get(period, 80)))
+            tasks.append((sym, period, limit, ROLLING_WIN.get(period, 80), oi_cache[sym]))
 
     alerts = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {ex.submit(process_one, s, p, l, w): (s, p) for (s, p, l, w) in tasks}
+        futures = {ex.submit(process_one, s, p, l, w, oi): (s, p) for (s, p, l, w, oi) in tasks}
         for fut in as_completed(futures):
             try:
                 res = fut.result()
