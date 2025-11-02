@@ -102,22 +102,35 @@ def fetch_oi_hist(symbol: str, period: str, limit: int) -> pd.DataFrame:
     df = df[["timestamp","sumOpenInterest","sumOpenInterestValue"]].sort_values("timestamp").reset_index(drop=True)
     return df
 
-def fetch_last_two_closes(symbol: str, period: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+def fetch_last_two_closes(symbol: str, period: str) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
     """
-    返回 (last_close, prev_close, pct_change)
-    pct_change = (last - prev) / prev
+    返回 (current_price, prev_close, price_change, pct_change)
+    price_change = current - prev (价格差值)
+    pct_change = (current - prev) / prev (百分比)
+
+    计算逻辑：
+    - current_price: 最新K线的当前收盘价（正在进行中的K线）
+    - prev_close: 上一根已完成K线的收盘价
+    - price_change: 价格变动的绝对差值
+    - pct_change: 价格变动的百分比
     """
     kl = um.klines(symbol=symbol, interval=period, limit=2)
     if not kl or len(kl) < 2:
-        # 尝试退化到1根（仅返回最新价）
+        # 数据不足，尝试退化到1根
         if kl and len(kl) == 1:
-            last_close = float(kl[0][4])
-            return last_close, None, None
-        return None, None, None
+            current_price = float(kl[0][4])
+            return current_price, None, None, None
+        return None, None, None, None
+
+    # kl[0] = 上一根已完成的K线
+    # kl[1] = 当前正在进行中的K线
     prev_close = float(kl[0][4])
-    last_close = float(kl[1][4])
-    pct = None if prev_close == 0 else (last_close - prev_close) / prev_close
-    return last_close, prev_close, pct
+    current_price = float(kl[1][4])
+
+    price_change = current_price - prev_close
+    pct = None if prev_close == 0 else price_change / prev_close
+
+    return current_price, prev_close, price_change, pct
 
 def classify_level(z_abs: float, pct: float, abs_usd: float) -> Optional[str]:
     def _is_nan(v):
@@ -159,7 +172,7 @@ def process_one(symbol: str, period: str, limit: int, win: int) -> Optional[Dict
         return None
 
     # 仅触发时补拉价格，并计算价格变化幅度
-    last_close, prev_close, px_pct = fetch_last_two_closes(symbol, period)
+    current_price, prev_close, price_change, px_pct = fetch_last_two_closes(symbol, period)
     direction = "↑" if (last["dOIValue"] > 0) else ("↓" if last["dOIValue"] < 0 else "=")
 
     return {
@@ -172,7 +185,8 @@ def process_one(symbol: str, period: str, limit: int, win: int) -> Optional[Dict
         "dOIValue": float(last["dOIValue"]) if pd.notna(last["dOIValue"]) else np.nan,
         "oi_value_pct": float(pct) if pct is not None else np.nan,
         "z_abs": float(z_abs) if z_abs is not None else np.nan,
-        "price": float(last_close) if last_close is not None else np.nan,
+        "price": float(current_price) if current_price is not None else np.nan,
+        "price_change": float(price_change) if price_change is not None else np.nan,
         "price_pct": float(px_pct) if px_pct is not None else np.nan,
     }
 
@@ -197,7 +211,7 @@ def scan_once(symbols: List[str]) -> pd.DataFrame:
     if not alerts:
         print("\n=== No anomalies (latest bars) ===")
         return pd.DataFrame(columns=[
-            "timestamp","symbol","period","level","direction","dOI","dOIValue","oi_value_pct","z_abs","price","price_pct"
+            "timestamp","symbol","period","level","direction","dOI","dOIValue","oi_value_pct","z_abs","price","price_change","price_pct"
         ])
 
     df = pd.DataFrame(alerts)
@@ -215,6 +229,7 @@ def scan_once(symbols: List[str]) -> pd.DataFrame:
         for _, r in sub.head(topk).iterrows():
             ts_sh = pd.to_datetime(r["timestamp"], utc=True).tz_convert(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S%z")
             px = r['price'] if not np.isnan(r['price']) else 'n/a'
+            px_change = (f"{r['price_change']:+.6f}" if not np.isnan(r['price_change']) else "n/a")
             pxpct = (f"{r['price_pct']*100:+.2f}%" if not np.isnan(r['price_pct']) else "n/a")
             print(
                 f"{ts_sh}  {r['symbol']:>12}  {period:>3}  "
@@ -222,7 +237,7 @@ def scan_once(symbols: List[str]) -> pd.DataFrame:
                 f"ΔOIv={r['dOIValue']:,.0f} USD  "
                 f"pct={r['oi_value_pct']*100:5.1f}%  "
                 f"z={r['z_abs']:.2f}  "
-                f"px={px}  pxΔ={pxpct}"
+                f"px={px}  pxΔ={px_change} ({pxpct})"
             )
     return df
 
@@ -243,6 +258,7 @@ def init_database(db_path: str):
     - oi_value_pct: OI 百分比变化
     - z_abs: z-score
     - price: 最新收盘价
+    - price_change: 价格变动差值
     - price_pct: 价格变化百分比
     """
     conn = sqlite3.connect(db_path)
@@ -263,6 +279,7 @@ def init_database(db_path: str):
             oi_value_pct REAL,
             z_abs REAL,
             price REAL,
+            price_change REAL,
             price_pct REAL
         )
     """)
@@ -317,7 +334,7 @@ def save_to_database(df: pd.DataFrame, db_path: str, run_time_sh: datetime) -> i
     columns = [
         "scan_time_shanghai", "timestamp", "timestamp_shanghai",
         "symbol", "period", "level", "direction",
-        "dOI", "dOIValue", "oi_value_pct", "z_abs", "price", "price_pct"
+        "dOI", "dOIValue", "oi_value_pct", "z_abs", "price", "price_change", "price_pct"
     ]
     df_out = df_out[columns]
 
