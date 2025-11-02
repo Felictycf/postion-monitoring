@@ -92,6 +92,7 @@ def get_top_symbols_by_quote_volume(candidates: List[str], top_n: Optional[int])
     return [s for s, _ in rows[:top_n]]
 
 def fetch_oi_hist(symbol: str, period: str, limit: int) -> pd.DataFrame:
+    """获取历史持仓量数据（用于统计基准）"""
     data = um.open_interest_hist(symbol=symbol, period=period, limit=limit)
     if not data:
         return pd.DataFrame()
@@ -101,6 +102,43 @@ def fetch_oi_hist(symbol: str, period: str, limit: int) -> pd.DataFrame:
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     df = df[["timestamp","sumOpenInterest","sumOpenInterestValue"]].sort_values("timestamp").reset_index(drop=True)
     return df
+
+def fetch_current_oi(symbol: str) -> Optional[Dict[str, float]]:
+    """
+    获取当前实时持仓量
+    返回: {"openInterest": 张数, "openInterestValue": 名义价值USD, "timestamp": 时间戳}
+
+    注意：openInterest 接口只返回持仓量（张数），不返回名义价值
+    需要通过 持仓量 × 当前价格 来计算名义价值
+    """
+    try:
+        # 获取实时持仓量
+        oi_data = um.open_interest(symbol=symbol)
+        if not oi_data:
+            return None
+
+        open_interest = float(oi_data.get("openInterest", 0))
+        timestamp = pd.to_datetime(oi_data.get("time", 0), unit="ms", utc=True)
+
+        # 获取当前价格（使用 ticker 接口）
+        ticker = um.ticker_price(symbol=symbol)
+        if not ticker:
+            return None
+
+        current_price = float(ticker.get("price", 0))
+
+        # 计算名义价值 = 持仓量 × 当前价格
+        open_interest_value = open_interest * current_price
+
+        return {
+            "openInterest": open_interest,
+            "openInterestValue": open_interest_value,
+            "timestamp": timestamp
+        }
+    except Exception as e:
+        print(f"[WARN] fetch_current_oi {symbol} failed: {e}")
+        return None
+
 
 def fetch_last_two_closes(symbol: str, period: str) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
     """
@@ -144,47 +182,69 @@ def classify_level(z_abs: float, pct: float, abs_usd: float) -> Optional[str]:
 
 def process_one(symbol: str, period: str, limit: int, win: int) -> Optional[Dict[str, Any]]:
     """
-    仅抓 OI，算出是否异动；若异动，再补拉该周期的最新两根收盘价以计算价格变化幅度。
-    返回告警字典；无告警返回 None
+    混合使用历史数据和实时数据：
+    1. 获取历史 OI 数据用于统计基准（计算 z-score）
+    2. 获取实时 OI 数据作为最新值
+    3. 计算实时 OI 与历史最后一根的变化
     """
-    df = fetch_oi_hist(symbol, period, limit)
-    if df.empty or len(df) < max(40, win + 5):
+    # 获取历史数据用于统计
+    df_hist = fetch_oi_hist(symbol, period, limit)
+    if df_hist.empty or len(df_hist) < max(40, win + 5):
         return None
 
-    # 差分与百分比
-    df["dOI"] = df["sumOpenInterest"].diff()
-    df["dOIValue"] = df["sumOpenInterestValue"].diff()
-    base_val = df["sumOpenInterestValue"].shift(1).replace(0, np.nan)
-    df["oi_value_pct"] = df["dOIValue"].abs() / base_val
+    # 获取实时持仓量
+    current_oi = fetch_current_oi(symbol)
+    if not current_oi:
+        return None
 
-    # z-score 基于 |ΔOI名义|
-    roll = df["dOIValue"].abs().rolling(win, min_periods=max(20, win//2))
-    mean_abs = roll.mean()
-    std_abs = roll.std(ddof=0)
-    df["z_abs"] = (df["dOIValue"].abs() - mean_abs) / std_abs
+    # 历史数据的最后一根（用于对比）
+    last_hist = df_hist.iloc[-1]
 
-    last = df.iloc[-1]
-    z_abs   = float(last["z_abs"]) if pd.notna(last["z_abs"]) else None
-    pct     = float(last["oi_value_pct"]) if pd.notna(last["oi_value_pct"]) else None
-    abs_usd = float(abs(last["dOIValue"])) if pd.notna(last["dOIValue"]) else None
-    level = classify_level(z_abs, pct, abs_usd)
+    # 计算实时 OI 与历史最后一根的变化
+    current_oi_contracts = current_oi["openInterest"]
+    current_oi_value = current_oi["openInterestValue"]
+
+    prev_oi_contracts = float(last_hist["sumOpenInterest"])
+    prev_oi_value = float(last_hist["sumOpenInterestValue"])
+
+    dOI = current_oi_contracts - prev_oi_contracts
+    dOIValue = current_oi_value - prev_oi_value
+
+    # 计算百分比
+    oi_value_pct = abs(dOIValue) / prev_oi_value if prev_oi_value != 0 else 0
+
+    # 使用历史数据计算 z-score 基准
+    df_hist["dOIValue"] = df_hist["sumOpenInterestValue"].diff()
+    roll = df_hist["dOIValue"].abs().rolling(win, min_periods=max(20, win//2))
+    mean_abs = roll.mean().iloc[-1]
+    std_abs = roll.std(ddof=0).iloc[-1]
+
+    # 计算当前变化的 z-score
+    z_abs = (abs(dOIValue) - mean_abs) / std_abs if std_abs > 0 else 0
+
+    # 判断是否异动
+    level = classify_level(
+        z_abs=float(z_abs) if not np.isnan(z_abs) else None,
+        pct=float(oi_value_pct) if not np.isnan(oi_value_pct) else None,
+        abs_usd=float(abs(dOIValue)) if not np.isnan(dOIValue) else None
+    )
     if not level:
         return None
 
     # 仅触发时补拉价格，并计算价格变化幅度
     current_price, prev_close, price_change, px_pct = fetch_last_two_closes(symbol, period)
-    direction = "↑" if (last["dOIValue"] > 0) else ("↓" if last["dOIValue"] < 0 else "=")
+    direction = "↑" if dOIValue > 0 else ("↓" if dOIValue < 0 else "=")
 
     return {
-        "timestamp": last["timestamp"],  # UTC tz-aware
+        "timestamp": current_oi["timestamp"],  # 使用实时 OI 的时间戳
         "symbol": symbol,
         "period": period,
         "level": level,
         "direction": direction,
-        "dOI": float(last["dOI"]) if pd.notna(last["dOI"]) else np.nan,
-        "dOIValue": float(last["dOIValue"]) if pd.notna(last["dOIValue"]) else np.nan,
-        "oi_value_pct": float(pct) if pct is not None else np.nan,
-        "z_abs": float(z_abs) if z_abs is not None else np.nan,
+        "dOI": float(dOI) if not np.isnan(dOI) else np.nan,
+        "dOIValue": float(dOIValue) if not np.isnan(dOIValue) else np.nan,
+        "oi_value_pct": float(oi_value_pct) if not np.isnan(oi_value_pct) else np.nan,
+        "z_abs": float(z_abs) if not np.isnan(z_abs) else np.nan,
         "price": float(current_price) if current_price is not None else np.nan,
         "price_change": float(price_change) if price_change is not None else np.nan,
         "price_pct": float(px_pct) if px_pct is not None else np.nan,
