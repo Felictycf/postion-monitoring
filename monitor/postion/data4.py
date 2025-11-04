@@ -4,6 +4,7 @@ Fast Binance UM Perpetual - Open Interest Anomaly Scanner (loop, save to SQLite)
 - 周期：5m/15m/30m/1h/4h
 - 每隔 2.5 分钟扫描一次
 - 每次扫描保存到 SQLite 数据库
+- Telegram Bot 推送异动提醒
 """
 
 from binance.um_futures import UMFutures
@@ -17,6 +18,15 @@ import math
 import os
 import time
 import sqlite3
+import requests
+from dotenv import load_dotenv
+
+# 加载环境变量
+load_dotenv()
+
+# Telegram Bot 配置
+TG_TOKEN = os.getenv("TG_Token")
+TG_CHAT_ID = os.getenv("TG_ChatId")
 
 # ================= 可配置 =================
 # 周期与历史长度（足够做滚动统计，不要太大）
@@ -59,7 +69,7 @@ MAX_WORKERS = 24
 PRINT_TOP_N_PER_PERIOD = 12
 
 # 轮询间隔（秒）= 2.5 分钟
-POLL_INTERVAL_SEC = 300
+POLL_INTERVAL_SEC = 350
 
 # SQLite 数据库路径
 DB_PATH = "./oi_alerts.db"
@@ -332,6 +342,121 @@ def scan_once(symbols: List[str]) -> pd.DataFrame:
             )
     return df
 
+def send_telegram_message(message: str) -> bool:
+    """
+    发送 Telegram 消息
+    """
+    if not TG_TOKEN or not TG_CHAT_ID:
+        print("[WARN] Telegram credentials not configured")
+        return False
+
+    try:
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        data = {
+            "chat_id": TG_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True
+        }
+        response = requests.post(url, data=data, timeout=10)
+        return response.status_code == 200
+    except Exception as e:
+        print(f"[WARN] Failed to send Telegram message: {e}")
+        return False
+
+def format_telegram_alert(alerts_df: pd.DataFrame) -> Optional[str]:
+    """
+    格式化异动信息为 Telegram 消息
+    只推送 Moderate/Major/Critical 级别的异动
+    按 symbol 分组，显示多个时间周期
+    """
+    if alerts_df.empty:
+        return None
+
+    # 过滤掉 Minor 级别
+    filtered = alerts_df[alerts_df["level"] != "Minor"].copy()
+
+    if filtered.empty:
+        return None
+
+    # 按 symbol 分组
+    grouped = filtered.groupby("symbol")
+
+    messages = []
+    for symbol, group in grouped:
+        # 按 level 严重程度排序（Critical > Major > Moderate）
+        level_order = {"Critical": 0, "Major": 1, "Moderate": 2}
+        group["level_order"] = group["level"].map(level_order)
+        group = group.sort_values("level_order")
+
+        # 获取最高级别
+        highest_level = group.iloc[0]["level"]
+
+        # 获取所有周期的信息
+        periods_info = []
+        for _, row in group.iterrows():
+            period = row["period"]
+            direction = row["direction"]
+            dOIValue = row["dOIValue"]
+            price = row["price"]
+            price_pct = row["price_pct"]
+
+            price_str = f"{price:.6f}" if not np.isnan(price) else "n/a"
+            price_pct_str = f"{price_pct*100:+.2f}%" if not np.isnan(price_pct) else "n/a"
+
+            periods_info.append(
+                f"  {period}: {direction} ΔOI=${dOIValue:,.0f} | 价格{price_str}({price_pct_str})"
+            )
+
+        # 构建消息
+        level_emoji = {
+            "Critical": "🔴",
+            "Major": "🟠",
+            "Moderate": "🟡"
+        }
+        emoji = level_emoji.get(highest_level, "⚪")
+
+        msg = f"{emoji} <b>{symbol}</b> - {highest_level}\n"
+        msg += "\n".join(periods_info)
+        messages.append(msg)
+
+    if not messages:
+        return None
+
+    # 组合所有消息
+    header = f"📊 <b>持仓量异动提醒</b>\n" \
+             f"⏰ {datetime.now(ZoneInfo('Asia/Shanghai')).strftime('%Y-%m-%d %H:%M:%S')}\n" \
+             f"━━━━━━━━━━━━━━━━\n\n"
+
+    return header + "\n\n".join(messages)
+
+def send_alerts_to_telegram(alerts_df: pd.DataFrame):
+    """
+    将异动信息推送到 Telegram
+    """
+    message = format_telegram_alert(alerts_df)
+    if message:
+        # Telegram 消息长度限制 4096 字符，需要分割
+        max_length = 4000
+        if len(message) <= max_length:
+            send_telegram_message(message)
+        else:
+            # 分割消息
+            parts = message.split("\n\n")
+            current_msg = parts[0] + "\n\n"  # header
+
+            for part in parts[1:]:
+                if len(current_msg) + len(part) + 2 <= max_length:
+                    current_msg += part + "\n\n"
+                else:
+                    send_telegram_message(current_msg)
+                    current_msg = part + "\n\n"
+
+            if current_msg.strip():
+                send_telegram_message(current_msg)
+
+        print(f"[Telegram] Sent {len(alerts_df[alerts_df['level'] != 'Minor'])} alerts")
+
 def init_database(db_path: str):
     """
     初始化 SQLite 数据库，创建 oi_alerts 表（如果不存在）。
@@ -440,7 +565,13 @@ def save_to_database(df: pd.DataFrame, db_path: str, run_time_sh: datetime) -> i
 
 def main_once(symbols: List[str]) -> pd.DataFrame:
     """执行一次扫描并返回结果 DataFrame（UTC 时间戳列），打印时已转上海。"""
-    return scan_once(symbols)
+    alerts_df = scan_once(symbols)
+
+    # 推送到 Telegram
+    if not alerts_df.empty:
+        send_alerts_to_telegram(alerts_df)
+
+    return alerts_df
 
 def main():
     # 初始化数据库
